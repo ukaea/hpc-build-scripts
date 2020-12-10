@@ -14,7 +14,7 @@ function load_modules() {
     module load rhel7/global
     module load cmake/latest
     #module load rhel7/default-peta4
-    module load gcc/9
+    module load gcc/7
     #module load openmpi/gcc/9.3/4.0.4
     module load openmpi-3.1.3-gcc-7.2.0-b5ihosk
 }
