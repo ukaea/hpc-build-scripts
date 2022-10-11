@@ -2,21 +2,15 @@
 #set -ue
 
 export STACK_SRC=`mktemp -d /tmp/moose_stack_src.XXXXXX`
-export WORKDIR=/home/$USER/moose_dev
+export WORKDIR=/home/dc-davi4/rds/rds-ukaea-ap001/moose_dev
 
 function load_modules() {
     module purge
-    module load slurm
-    module load dot
-    module load turbovnc/2.0.1
-    module load vgl/2.5.1/64
-    module load singularity/current
-    module load rhel7/global
-    module load cmake/latest
-    #module load rhel7/default-peta4
-    module load gcc/7
-    #module load openmpi/gcc/9.3/4.0.4
-    module load openmpi-3.1.3-gcc-7.2.0-b5ihosk
+    # module load openmpi-3.1.3-gcc-7.2.0-b5ihosk gcc/7 cmake/latest
+    module load rhel7/default-ccl
+    module load openmpi/gcc/9.2/4.0.1
+    #module load openmpi
+    #module load libiconv-1.15-gcc-5.4.0-ymwv5vs
 }
 
 function _build_mpich33() {
@@ -108,34 +102,170 @@ function _build_petsc() {
 } 
 
 function build_moose() {
-    export MOOSE_JOBS=24
+    export MOOSE_JOBS=32
     cd $WORKDIR
     if [ -d "$WORKDIR/moose" ] ; then
        return
     fi
 #    _build_mpich33
-    _build_petsc
+    load_modules    
+    build_vtk_git
+    cd $WORKDIR
     git clone https://github.com/idaholab/moose
-    cd moose
+    cd moose 
     git checkout master
+    unset PETSC_DIR PETSC_ARCH
+    ./scripts/update_and_rebuild_petsc.sh --prefix=$WORKDIR/petsc --with-debugging=no CXXOPTFLAGS='-O3 -march=cascadelake -funroll-loops' COPTFLAGS='-O3 -march=cascadelake -funroll-loops' FOPTFLAGS='-O3 -march=cascadelake' --download-cmake=1  --with-64-bit-indices=1 --download-make=1 --with-ptscotch=0
+    if [ ! -f "$WORKDIR/petsc/lib/libpetsc.so" ] ; then
+      echo "PETSc Install Unsuccessful"
+      return
+    fi 
+
     export PETSC_DIR=$WORKDIR/petsc
     export CC=mpicc
     export CXX=mpicxx
     export F90=mpif90
     export F77=mpif77
     export FC=mpif90
-    ./scripts/update_and_rebuild_libmesh.sh --with-mpi
-    cd test
-    make -j 4
-    ./run_tests -j 4
-    cd ..
+    if [ -d "$WORKDIR/vtk" ] ; then
+      echo "building libmesh with VTK" 
+      METHODS='opt' ./scripts/update_and_rebuild_libmesh.sh --with-mpi --with-cxx-std=2017 --with-vtk-include=$WORKDIR/vtk/include/vtk-9.1 --with-vtk-lib=$WORKDIR/vtk/lib64 --enable-vtk-required
+    else
+      echo "Building libmesh withOUT VTK"
+      METHODS='opt' ./scripts/update_and_rebuild_libmesh.sh --with-mpi --with-cxx-std=2017 
+    fi 
+    ./configure --with-derivative-size=600 --with-ad-indexing-type=global
     cd framework
-    ./configure --with-derivative-size=200 --with-ad-indexing-type=global
-    make -j4
+    METHOD=opt make -j32
     cd ..
     cd modules
-    make -j 4
+    METHOD=opt make -j32
     cd ..
+    cd ..
+}
+
+function build_boost() {
+    cd $WORKDIR
+    if [ -d "$WORKDIR/boost-1.79.0" ] ; then
+       return
+    fi
+
+    git clone --recursive https://github.com/boostorg/boost
+    cd boost
+    git checkout boost-1.79.0
+    ./bootstrap.sh --prefix=$WORKDIR/boost-1.79.0
+    ./b2 --prefix=$WORKDIR/boost-1.79.0 install
+    cd ..
+    rm -rf boost
+}
+
+function build_eigen() {
+  if [ -d "$WORKDIR/eigen" ] ; then
+      export EIGEN3_DIR=$WORKDIR/eigen3
+      return
+  fi
+  cd $WORKDIR
+  git clone https://gitlab.com/libeigen/eigen.git
+  cd eigen
+  git checkout 3.3.0
+  mkdir bld
+  cd bld
+  CC=$CC CXX=$CXX FC=$FC cmake .. -DCMAKE_INSTALL_PREFIX=$WORKDIR/eigen3
+  make -j4
+  make install
+  cd ..
+  export EIGEN3_DIR=$PWD
+  cd ..
+  rm -rf eigen
+}
+
+
+function build_precise() {
+    cd $WORKDIR
+    if [ -d "$WORKDIR/precise" ] ; then
+       return
+    fi
+
+    ./build_boost 
+    ./build_eigen3
+
+    export PETSC_DIR=$WORKDIR/petsc
+    export PETSC_ARCH="arch-moose"
+	
+    git clone https://github.com/precice/precice
+    cd precise
+    mkdir bld
+    cd bld
+    cmake .. -DBoost_INCLUDE_DIR=$WORKDIR/boost-1.79.0/include -DEIGEN3_INCLUDE_DIR=$WORKDIR/eigen3/include/eigen3
+
+    make -j4
+    make install
+    cd ..
+    cd ..
+}
+
+function build_vtk_git() {
+    cd $WORKDIR
+    if [ -d "$WORKDIR/vtk" ] ; then
+       return
+    fi
+    git clone https://gitlab.kitware.com/vtk/vtk
+    cd vtk
+    git checkout v9.1.0
+    mkdir bld
+    cd bld
+    CC=mpicc CXX=mpicxx cmake .. -DVTK_GROUP_ENABLE_MPI=YES -DVTK_USE_MPI=ON -DCMAKE_INSTALL_PREFIX=$WORKDIR/vtk
+    make -j8 
+    make install
+    cd ..
+    cd lib64
+    # this is needed since moose expects to find libraries of the form libVTK.so
+    # but this version of vtk provies libVTK-9.2.so and thus libmesh can't find vtk
+    list=`ls | grep '\-9.1.so$'`
+    for i in $list ; do
+        renamed=`echo $i | sed -e s'/\-9.1//'g`
+        ln -s $i $renamed
+    done
+   
+    cd ..
+    
+}
+
+function build_vtk_92() {
+    cd $WORKDIR
+    if [ -d "$WORKDIR/vtk" ] ; then
+       return
+    fi
+    mkdir vtk
+    cd vtk
+    wget https://www.vtk.org/files/release/9.2/VTK-9.2.0.rc2.tar.gz
+    tar -zxf VTK-9.2.0.rc2.tar.gz
+    cd VTK-9.2.0.rc2
+    mkdir bld
+    cd bld
+    CC=mpicc CXX=mpicxx cmake .. -DVTK_GROUP_ENABLE_MPI=YES -DVTK_USE_MPI=ON -DCMAKE_INSTALL_PREFIX=$WORKDIR/vtk
+    make -j8 
+    make install
+    cd ..
+    cd ..
+    cd $WORKDIR/vtk/lib64
+    # this is needed since moose expects to find libraries of the form libVTK.so
+    # but this version of vtk provies libVTK-9.2.so and thus libmesh can't find vtk
+    list=`ls | grep '\-9.2.so$'`
+    for i in $list ; do
+        renamed=`echo $i | sed -e s'/\-9.2//'g`
+        ln -s $i $renamed
+    done
+}
+
+function build_astrea() {
+    cd $WORKDIR
+    if [ -d "$WORKDIR/astrea" ] ; then
+       return
+    fi
+
+    git clone https://github.com/aurora-multiphysics/astraea
+    cd astrea
     cd ..
 }
 
